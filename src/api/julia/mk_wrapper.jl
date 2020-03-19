@@ -3,21 +3,48 @@ using Clang.LibClang
 
 # ------------------------------------------------------------------------------
 
-includes = [
-    "/Users/ahumenberger/repo/z3/src/api",
-    "/usr/local/include",
-    "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/../include/c++/v1",
-    "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0/include",
-    "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include",
-    "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include",
-    "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks"
-]
+function compiler_preprocessor_verbose(compiler, flags)
+    cmd = [compiler, "-E"] 
+    append!(cmd, flags)
+    append!(cmd, ["-", "-v"])
+    err = Pipe()
+    process = run(pipeline(Cmd(cmd); stdin=devnull, stdout=devnull, stderr=err))
+    close(err.in)
+    stderr = String(read(err))
+    return split(stderr, "\n")
+end
+
+function system_include_paths(compiler::String)
+    flags = ["-x", "c++"]
+    lines = compiler_preprocessor_verbose(compiler, flags)
+    lines = [strip(l) for l in lines]
+
+    _start = findfirst(x->x=="#include <...> search starts here:", lines)
+    _end   = findfirst(x->x=="End of search list.", lines)
+
+    lines = lines[_start+1:_end-1]
+    paths = String[]
+    for line in lines
+        line = replace(line, "(framework directory)"=>"")
+        line = strip(line)
+        push!(paths, line)
+    end
+    return paths
+end
+
+includes = system_include_paths("clang")
+push!(includes, dirname(pwd()))
 
 args = [
     "-x",
     "c++",
     "-std=c++11",
 ]
+
+const CPP_FILE    = joinpath(dirname(pwd()), "c++", "z3++.h")
+const TRANS_UNIT  = parse_header(CPP_FILE, args=args, includes=includes)
+const ROOT_CURSOR = getcursor(TRANS_UNIT)
+const Z3_CURSOR   = search(ROOT_CURSOR, x->kind(x)==CXCursor_Namespace && spelling(x)=="z3")[1]
 
 # ------------------------------------------------------------------------------
 
@@ -35,24 +62,18 @@ end
 # ------------------------------------------------------------------------------
 
 function write_wrapper(io::IO)
-    @info io
     write_header(io)
     println(io, "")
-    write_supertypes(io, _classes, _structs)
+    write_supertypes(io, Z3_CURSOR)
     println(io, "")
     println(io, "JLCXX_MODULE define_julia_module(jlcxx::Module &$(module_obj()))\n{")
-    write_classes(io)
+    write_classes(io, Z3_CURSOR)
     println(io, "")
-    write_enums(io)
+    write_enums(io, Z3_CURSOR)
     println(io, "")
     write_custom(io)
     println(io, "")
-    # write_maptypes(io, _structs)
-    for c in _classes
-        println(io, "")
-        write_constructors(io, c)
-        write_member_functions(io, c)
-    end
+    write_members(io, Z3_CURSOR)
     println(io, "")
     write_functions(io, Z3_CURSOR)
     println(io, "}")
@@ -82,14 +103,7 @@ end
 
 # ------------------------------------------------------------------------------
 
-trans_unit = parse_header("/Users/ahumenberger/repo/z3/src/api/c++/z3++.h", args=args, includes=includes)
-root_cursor = getcursor(trans_unit)
-Z3_CURSOR = search(root_cursor, x->kind(x)==CXCursor_Namespace && spelling(x)=="z3")[1]
-
-# _classes = [c for c in search(z3_cursor, CXCursor_ClassDecl) if c == getdef(c) && !(spelling(c) in EXCLUDED_CLASSES)]
-_classes = [c for c in search(Z3_CURSOR, CXCursor_ClassDecl) if !(spelling(c) in EXCLUDED_CLASSES)]
-_structs = [c for c in search(Z3_CURSOR, CXCursor_StructDecl)]
-_enums   = [c for c in search(Z3_CURSOR, CXCursor_EnumDecl)]
+# ------------------------------------------------------------------------------
 
 _custom_added_types = CLCursor[]
 add_custom_type!(c::CLCursor) = push!(_custom_added_types, c)
@@ -118,7 +132,13 @@ julia_func_name(fn::String) = get(FUNCTION_MAP, fn, fn)
 
 is_const_fn(cursor) = clang_CXXMethod_isConst(cursor) == 1
 
-is_C_API_type(cursor) = startswith(spelling(cursor), "Z3_")
+is_C_API(cursor) = startswith(spelling(cursor), "Z3_") || startswith(spelling(cursor), "_Z3_")
+
+is_operator(cursor) = startswith(spelling(cursor), "operator")
+function get_operator(cursor)
+    @assert is_operator(cursor)
+    spelling(cursor)[9:end]
+end
 
 # ------------------------------------------------------------------------------
 
@@ -135,6 +155,15 @@ function qualified(cursor)
     return spelling(cursor)
 end
 
+function argstr(cursor)
+    join([spelling(type(c)) for c in function_args(cursor)], ", ")
+end
+
+function retstr(cursor)
+    t = result_type(cursor)
+    return spelling(t)
+end
+
 function base_type(c::CLParmDecl)
     t = canonical(type(c))
     if t isa CLLValueReference
@@ -142,6 +171,22 @@ function base_type(c::CLParmDecl)
     end
     return t
 end
+
+function get_type(m::CLCXXMethod)
+    ret    = retstr(m)
+    args   = argstr(m)
+    consts = is_const_fn(m) ? " const" : ""
+    class  = qualified(get_semantic_parent(m))
+    return "$(ret) ($(class)::*)($(args))$(consts)"
+end
+
+function get_type(m::CLFunctionDecl)
+    ret  = retstr(m)
+    args = argstr(m)
+    return "$(ret) (*)($(args))"
+end
+
+# ------------------------------------------------------------------------------
 
 function is_type_wrapped(c::CLRecord)
     decl = typedecl(c)
@@ -158,10 +203,11 @@ function is_type_wrapped(c::CLRecord)
 end
 
 is_type_wrapped(c::CLEnum) = is_wrappable(c)
+is_type_wrapped(c::CLTypedef) = !is_C_API(c)
 is_type_wrapped(c::CLType) = true
 
 function is_type_wrapped(c::CLParmDecl)
-    is_C_API_type(type(c)) && return false
+    is_C_API(type(c)) && return false
     t = base_type(c)
     return is_type_wrapped(t)
 end
@@ -185,73 +231,47 @@ function is_wrappable(cursor::CLConstructor)
     return true
 end
 
-is_wrappable(cursor::CLEnumDecl) = true
+is_wrappable(cursor::CLEnumDecl) = !is_C_API(cursor)
 is_wrappable(cursor::CLEnum) = is_wrappable(typedecl(cursor))
-
-is_wrappable(cursor::CLStructDecl) = is_C_API_type(cursor)
+is_wrappable(cursor::CLStructDecl) = is_C_API(cursor)
 
 function is_wrappable(cursor::CLClassDecl)
     if spelling(cursor) in EXCLUDED_CLASSES
         SKIP(cursor, "Manually excluded")
         return false
     end
-    return true
+    return getdef(cursor) == cursor
 end
 
-function argstr(cursor)
-    join([spelling(type(c)) for c in function_args(cursor)], ", ")
-end
+# ------------------------------------------------------------------------------
 
-function retstr(cursor)
-    t = result_type(cursor)
-    return spelling(t)
-end
-
-function write_supertypes(io::IO, class_cursors, struct_cursors)
+function write_supertypes(io::IO, parent::CLCursor)
     println(io, "namespace jlcxx\n{")
-    for c in class_cursors
+    for c in search(parent, CXCursor_ClassDecl)
         cname = name(c)
         baseclasses = search(c, CXCursor_CXXBaseSpecifier)
         if length(baseclasses) == 1
-            # tname = spelling(type(baseclasses[1]))
             s = qualified(c)
             t = qualified(typedecl(type(baseclasses[1])))
-            # bname = split(tname, "::")[2]
             print(io, INDENT)
             println(io, "template<> struct SuperType<$(s)> { typedef $(t) type; };")
         elseif length(baseclasses) > 1
             @warn "Cannot handle more than one base class, skipping $(c)"
         end
     end
-    println(io, "")
-    for c in struct_cursors
-        print(io, INDENT)
-        println(io, "template<> struct IsMirroredType<$(qualified(c))> : std::true_type { };")
-    end
-
     println(io, "}")
 end
 
-
-function write_member_function(io::IO, name::String, class::String, returntype::String, args::String, isconst::Bool; is_callop::Bool=false)
-    conststr = isconst ? " const" : ""
-    jl_name = isconst ? name : "$(name)!"
-    namestr = is_callop ? "" : "\"$(jl_name)\", "
-    println(io, "$(wrapper_obj(class)).method($(namestr)static_cast<$(returntype) (*)($(args))$(conststr)>(&$(class)::$(name)));")
+function write_members(io::IO, parent::CLCursor)
+    for c in search(parent, CXCursor_ClassDecl)
+        !is_wrappable(c) && continue
+        println(io, "")
+        write_constructors(io, c)
+        write_member_functions(io, c)
+    end
 end
 
-function write_function(io::IO, name::String, returntype::String, args::String)
-    println(io, "$(module_obj()).method(\"$(name)\", static_cast<$(returntype) (*)($(args))>(&$(name)));")
-end
-
-is_operator(cursor) = startswith(spelling(cursor), "operator")
-function get_operator(cursor)
-    @assert is_operator(cursor)
-    spelling(cursor)[9:end]
-end
-
-
-function write_operator(io::IO, cursor; class="")
+function write_operator(io::IO, cursor)
     op = get_operator(cursor)
     argtypes = map(type, function_args(cursor))
     args = map(spelling, argtypes)
@@ -270,7 +290,7 @@ function write_operator(io::IO, cursor; class="")
     elseif op == "[]"
         if argtypes[1] isa CLInt
             class_cursor = get_semantic_parent(cursor)
-            class   = qualified(class_cursor)
+            class = qualified(class_cursor)
             println(io,
                 """
                     $(set_override())
@@ -307,27 +327,13 @@ function write_operator(io::IO, cursor; class="")
     end
 end
 
-function get_type(m::CLCXXMethod)
-    ret    = retstr(m)
-    args   = argstr(m)
-    consts = is_const_fn(m) ? " const" : ""
-    class  = qualified(get_semantic_parent(m))
-    return "$(ret) ($(class)::*)($(args))$(consts)"
-end
-
-function get_type(m::CLFunctionDecl)
-    ret  = retstr(m)
-    args = argstr(m)
-    return "$(ret) (*)($(args))"
-end
-
 function write_member_functions(io::IO, class_cursor)
     class_name = name(class_cursor)
     for cursor in search(class_cursor, CXCursor_CXXMethod)
         if clang_getCXXAccessSpecifier(cursor) == CX_CXXPublic
             !is_wrappable(cursor) && continue
             if is_operator(cursor)
-                write_operator(io, cursor, class=class_name)
+                write_operator(io, cursor)
             elseif clang_CXXMethod_isStatic(cursor) == 1
                 SKIP(cursor, "Static functions not yet supported")
             else
@@ -376,18 +382,14 @@ function write_header(io::IO)
     """)
 end
 
-function write_maptypes(io::IO, cursors)
-    for c in cursors
-        class = name(c)
-        println(io, "$(module_obj()).map_type<$(class)>(\"Ptr{Void}\");")
-    end
-end
-
-function write_classes(io::IO)
-    for c in search(Z3_CURSOR, CXCursor_ClassDecl)
+function write_classes(io::IO, parent::CLCursor)
+    for c in search(parent, CXCursor_ClassDecl)
         !is_wrappable(c) && continue
         baseclasses = search(c, CXCursor_CXXBaseSpecifier)
-        @assert length(baseclasses) <= 1
+        if length(baseclasses) > 1
+            SKIP(c, "More than one base classes")
+            continue
+        end
         class = qualified(c)
         name  = spelling(c)
         if length(baseclasses) == 0
@@ -401,8 +403,8 @@ function write_classes(io::IO)
     end
 end
 
-function write_enums(io::IO)
-    for c in search(Z3_CURSOR, CXCursor_EnumDecl)
+function write_enums(io::IO, parent::CLCursor)
+    for c in search(parent, CXCursor_EnumDecl)
         !is_wrappable(c) && continue
         name    = spelling(c)
         jl_name = julia_name(name)
@@ -415,12 +417,6 @@ function write_enums(io::IO)
         end
     end
 end
-
-
-# for c in search(z3_cursor, CXCursor_ClassTemplate)
-#     @info c c == getdef(c)
-#     # write_member_functions(stdout, c)
-# end
 
 open("z3jl.cpp", "w") do io
     write_wrapper(io)
